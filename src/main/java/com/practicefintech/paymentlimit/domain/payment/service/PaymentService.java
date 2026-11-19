@@ -17,25 +17,20 @@ import org.springframework.http.HttpStatus;
 import org.springframework.stereotype.Service;
 
 import java.util.Optional;
+import java.util.concurrent.ConcurrentHashMap;
 
 /**
- * [2단계: 예외 처리] API 명세의 모든 상황을 상태 코드로 구분해 응답합니다.
+ * 결제 승인, 취소, 한도 조회. 동시성 처리는 이 클래스에서 한다.
+ * (설계 이유는 docs/answer.md 참고)
  *
- * 1단계에 더해 추가한 것
- * - 결제 ID 중복 → 409 DUPLICATE_PAYMENT (취소된 결제 ID도 재사용 불가)
- * - 한도 초과 → 422 LIMIT_EXCEEDED (거절한 결제는 저장하지 않으므로 같은 ID로 다시 요청 가능)
- * - 없는 결제 취소 → 404 PAYMENT_NOT_FOUND, 이미 취소된 결제 → 409 ALREADY_CANCELED
- * - 승인 요청 검사 순서: 입력 검증(400) → 중복(409) → 한도(422) → 승인(200)
- *
- * 이 단계에서 일부러 하지 않는 것: 동시 요청 처리 (3단계 = {@code ../solution/})
- *
- * 왜 아직 깨지는가
- * - 승인: "결제 ID가 있는지 확인" 다음 줄에서 저장하기까지, 그리고 "사용액을 읽고 → 한도를 판단하고 → 쓰기"까지
- *   사이사이에 다른 요청이 끼어들 수 있습니다. 두 요청이 동시에 "아직 없다", "아직 여유가 있다"고 판단하면
- *   같은 결제 ID가 두 번 승인되거나 사용액이 한도를 넘습니다.
- * - 취소: "취소 상태인지 확인"과 "사용액 빼기" 사이에 같은 일이 생겨 한도가 두 번 복원됩니다.
- * - {@link LimitStore}는 호출마다 50~150ms가 걸려서 이 틈이 눈에 보일 만큼 벌어집니다.
- *   저장소 자체는 스레드 안전하지만, 여러 호출을 묶은 흐름까지 지켜 주지는 않습니다.
+ * 1) 결제 ID마다 모니터 락(paymentLocks)을 두고, 기존 결제 확인부터 처리까지 이 락 안에서 수행한다.
+ *    락 기준이 사용자와 관계없는 결제 ID이므로, 같은 결제 ID를 같은 사용자나 다른 사용자가
+ *    동시에 보내도 한 스레드만 통과한다. (S3, S4)
+ *    한도 초과(422)로 끝나면 아무것도 저장하지 않고 락을 빠져나가므로, 그 ID는 다시 사용할 수 있다.
+ *    선점을 해제하는 코드는 따로 필요 없다.
+ * 2) 사용자 한도(사용액 읽기, 판단, 쓰기)는 사용자마다 락(userLocks)을 두어 보호한다.
+ *    서로 다른 사용자의 결제는 병렬로 처리된다. (S1, S5)
+ * 3) 락은 항상 paymentLock, userLock 순서로 걸기 때문에 교착 상태가 생기지 않는다.
  */
 @Service
 @RequiredArgsConstructor
@@ -46,50 +41,79 @@ public class PaymentService {
     private final LimitStore limitStore;
     private final FeePolicy feePolicy;
 
+    /** 결제 ID별 락. 사용자와 무관하게 결제 ID 전역에서 유일함을 보장한다. */
+    private final ConcurrentHashMap<String, Object> paymentLocks = new ConcurrentHashMap<>();
+    /** 사용자 ID별 락. 한도 사용액을 읽고-판단하고-쓰는 구간을 보호한다. */
+    private final ConcurrentHashMap<String, Object> userLocks = new ConcurrentHashMap<>();
+
     public PaymentApprovedResponse approve(PaymentRequest request) {
-        // (1) 결제 ID 중복 확인 — 이 확인과 아래 savePayment 사이가 비어 있습니다. (3단계에서 락으로 묶습니다)
-        if (limitStore.findPayment(request.getPaymentId()).isPresent()) {
-            // 승인이었든 취소였든 기록이 남아 있으면 중복입니다.
-            throw new ApiException(HttpStatus.CONFLICT, ErrorCode.DUPLICATE_PAYMENT,
-                    "이미 존재하는 결제 ID입니다.", request.getPaymentId());
+        // [검사 1] 입력 검증(400)은 컨트롤러의 @Valid가 이미 끝냈다. 여기 오는 요청은 형식이 올바르다.
+
+        // [바깥 락] 결제 ID 단위. computeIfAbsent라서 같은 ID의 첫 요청 둘이 동시에 와도
+        // 락 객체는 하나만 만들어진다. (get 해 보고 없으면 put하는 직접 구현은 그 사이가 또 경쟁 구간이다)
+        Object paymentLock = paymentLocks.computeIfAbsent(request.getPaymentId(), id -> new Object());
+        synchronized (paymentLock) {
+            // [검사 2] 결제 ID 중복(409). 이 확인과 아래 savePayment가 같은 락 안에 있어서
+            // 같은 ID 동시 10건 중 1건만 통과한다. 사용자가 달라도 같은 ID면 막힌다. (S3, S4)
+            if (limitStore.findPayment(request.getPaymentId()).isPresent()) {
+                // 이미 있는 기록이면 승인이었든 취소였든(재사용 불가, D3) 중복입니다.
+                throw new ApiException(HttpStatus.CONFLICT, ErrorCode.DUPLICATE_PAYMENT,
+                        "이미 존재하는 결제 ID입니다.", request.getPaymentId());
+            }
+
+            // [안쪽 락] 사용자 단위. 락 순서는 언제나 결제 ID → 사용자(취소도 같은 순서)라 교착이 없다.
+            Object userLock = userLocks.computeIfAbsent(request.getUserId(), id -> new Object());
+            synchronized (userLock) {
+                // [검사 3] 한도(422). 사용액 읽기 → 판단 → 쓰기가 같은 락 안이라,
+                // 동시 요청이 같은 사용액을 각자 읽고 덮어쓰는 일이 없다. (S5: 400,000원 3건 → 2건만 승인)
+                long used = limitStore.getUsedAmount(request.getUserId());
+                long newUsed = used + request.getAmount();
+                if (newUsed > DAILY_LIMIT) {
+                    // 저장을 하지 않고 그냥 락을 빠져나가면, 이 paymentId는 다시 요청할 수 있습니다.
+                    throw new ApiException(HttpStatus.UNPROCESSABLE_CONTENT, ErrorCode.LIMIT_EXCEEDED,
+                            "한도를 초과했습니다.", request.getPaymentId());
+                }
+
+                // [승인] 수수료는 상태가 없는 순수 계산이라 어디서 불러도 같은 값이다.
+                long fee = feePolicy.calculate(request.getGrade(), request.getPayType(), request.getAmount());
+                limitStore.setUsedAmount(request.getUserId(), newUsed);
+                limitStore.savePayment(new PaymentRecord(
+                        request.getPaymentId(), request.getUserId(), request.getAmount(), fee,
+                        PaymentState.APPROVED, System.currentTimeMillis()));
+
+                return PaymentApprovedResponse.approved(
+                        request.getPaymentId(), request.getUserId(), request.getAmount(), fee, DAILY_LIMIT - newUsed);
+            }
         }
-
-        // (2) 한도 확인 — 읽기, 판단, 쓰기가 떨어져 있는 "확인 후 실행" 구간입니다. (3단계에서 락으로 묶습니다)
-        long used = limitStore.getUsedAmount(request.getUserId());
-        long newUsed = used + request.getAmount();
-        if (newUsed > DAILY_LIMIT) {
-            // 거절할 때는 아무것도 저장하지 않습니다. 그래서 이 결제 ID는 다시 쓸 수 있습니다.
-            throw new ApiException(HttpStatus.UNPROCESSABLE_CONTENT, ErrorCode.LIMIT_EXCEEDED,
-                    "한도를 초과했습니다.", request.getPaymentId());
-        }
-
-        long fee = feePolicy.calculate(request.getGrade(), request.getPayType(), request.getAmount());
-        limitStore.setUsedAmount(request.getUserId(), newUsed);
-        limitStore.savePayment(new PaymentRecord(
-                request.getPaymentId(), request.getUserId(), request.getAmount(), fee,
-                PaymentState.APPROVED, System.currentTimeMillis()));
-
-        return PaymentApprovedResponse.approved(
-                request.getPaymentId(), request.getUserId(), request.getAmount(), fee, DAILY_LIMIT - newUsed);
     }
 
     public CancelResponse cancel(String paymentId) {
-        PaymentRecord record = limitStore.findPayment(paymentId)
-                .orElseThrow(() -> new ApiException(HttpStatus.NOT_FOUND, ErrorCode.PAYMENT_NOT_FOUND,
-                        "결제를 찾을 수 없습니다.", paymentId));
+        // 승인과 같은 결제 ID 락을 잡는다. 같은 결제의 취소 10건이 동시에 와도 1건만 통과한다. (S9)
+        Object paymentLock = paymentLocks.computeIfAbsent(paymentId, id -> new Object());
+        synchronized (paymentLock) {
+            // 없는 결제는 404, 이미 취소된 결제는 409. 취소돼도 기록은 CANCELED로 남아 있어서
+            // 같은 ID로 다시 승인하려 하면 approve의 중복 확인(409)에 걸린다. (S10)
+            PaymentRecord record = limitStore.findPayment(paymentId)
+                    .orElseThrow(() -> new ApiException(HttpStatus.NOT_FOUND, ErrorCode.PAYMENT_NOT_FOUND,
+                            "결제를 찾을 수 없습니다.", paymentId));
 
-        if (record.getState() == PaymentState.CANCELED) {
-            throw new ApiException(HttpStatus.CONFLICT, ErrorCode.ALREADY_CANCELED,
-                    "이미 취소된 결제입니다.", paymentId);
+            if (record.getState() == PaymentState.CANCELED) {
+                throw new ApiException(HttpStatus.CONFLICT, ErrorCode.ALREADY_CANCELED,
+                        "이미 취소된 결제입니다.", paymentId);
+            }
+
+            // 사용액 복원도 승인과 같은 사용자 락 안에서 한다. 취소와 승인이 동시에 와도
+            // 사용액이 겹쳐 쓰이지 않는다. (S11: 최종 사용액 = 취소되지 않은 승인 금액의 합)
+            Object userLock = userLocks.computeIfAbsent(record.getUserId(), id -> new Object());
+            synchronized (userLock) {
+                long used = limitStore.getUsedAmount(record.getUserId());
+                long restored = used - record.getAmount();
+                limitStore.setUsedAmount(record.getUserId(), restored);
+                limitStore.savePayment(record.withState(PaymentState.CANCELED));
+
+                return CancelResponse.canceled(paymentId, record.getAmount(), DAILY_LIMIT - restored);
+            }
         }
-
-        // 위 확인과 아래 사용액 변경 사이에 같은 취소 요청이 끼어들 수 있습니다. (3단계)
-        long used = limitStore.getUsedAmount(record.getUserId());
-        long restored = used - record.getAmount();
-        limitStore.setUsedAmount(record.getUserId(), restored);
-        limitStore.savePayment(record.withState(PaymentState.CANCELED));
-
-        return CancelResponse.canceled(paymentId, record.getAmount(), DAILY_LIMIT - restored);
     }
 
     public LimitResponse getLimit(String userId) {

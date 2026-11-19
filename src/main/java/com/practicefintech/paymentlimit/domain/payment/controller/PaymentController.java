@@ -15,12 +15,7 @@ import lombok.RequiredArgsConstructor;
 import org.springframework.http.HttpStatus;
 import org.springframework.web.bind.annotation.*;
 
-/**
- * [2단계: 예외 처리] 1단계에서 빼 두었던 {@code @Valid}(입력 검증 400)와 수수료 조회의 금액 범위 검사를 넣습니다.
- * 에러 응답 형식은 {@link com.practicefintech.paymentlimit.common.exception.GlobalExceptionHandler}가 통일합니다.
- *
- * 결제 승인, 취소, 한도 조회, 수수료 계산 API. 실제 로직은 {@link PaymentService}, {@link com.practicefintech.paymentlimit.domain.fee.service.FeePolicy}에 있다.
- */
+/** 결제 승인, 취소, 한도 조회, 수수료 계산 API. 실제 로직은 {@link PaymentService}, {@link com.practicefintech.paymentlimit.domain.fee.service.FeePolicy}에 있다. */
 @RestController
 @RequiredArgsConstructor
 public class PaymentController {
