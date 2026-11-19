@@ -1,23 +1,25 @@
 package com.practicefintech.paymentlimit.domain.payment.controller;
 
+import com.practicefintech.paymentlimit.common.enums.ErrorCode;
 import com.practicefintech.paymentlimit.common.enums.Grade;
 import com.practicefintech.paymentlimit.common.enums.PayType;
+import com.practicefintech.paymentlimit.common.exception.ApiException;
 import com.practicefintech.paymentlimit.domain.fee.model.response.FeeQueryResponse;
 import com.practicefintech.paymentlimit.domain.payment.model.request.PaymentRequest;
 import com.practicefintech.paymentlimit.domain.payment.model.response.CancelResponse;
 import com.practicefintech.paymentlimit.domain.payment.model.response.LimitResponse;
 import com.practicefintech.paymentlimit.domain.payment.model.response.PaymentApprovedResponse;
 import com.practicefintech.paymentlimit.domain.payment.service.PaymentService;
+import jakarta.validation.Valid;
 import lombok.RequiredArgsConstructor;
+import org.springframework.http.HttpStatus;
 import org.springframework.web.bind.annotation.*;
 
 /**
- * [1단계: 정상 경로] 결제 승인, 취소, 한도 조회, 수수료 계산 API.
- * 경로와 메서드 시그니처는 처음부터 최종본과 같게 두고, 안의 내용만 단계마다 채워 갑니다.
+ * [2단계: 예외 처리] 1단계에서 빼 두었던 {@code @Valid}(입력 검증 400)와 수수료 조회의 금액 범위 검사를 넣습니다.
+ * 에러 응답 형식은 {@link com.practicefintech.paymentlimit.common.exception.GlobalExceptionHandler}가 통일합니다.
  *
- * 이 단계에서 일부러 하지 않는 것
- * - {@code @Valid}를 비롯한 입력 검증(400)과 수수료 조회의 금액 범위 검사  → 2단계
- * - 에러 응답 형식 통일({@code GlobalExceptionHandler})  → 2단계
+ * 결제 승인, 취소, 한도 조회, 수수료 계산 API. 실제 로직은 {@link PaymentService}, {@link com.practicefintech.paymentlimit.domain.fee.service.FeePolicy}에 있다.
  */
 @RestController
 @RequiredArgsConstructor
@@ -26,7 +28,7 @@ public class PaymentController {
     private final PaymentService paymentService;
 
     @PostMapping("/api/v1/payments")
-    public PaymentApprovedResponse approve(@RequestBody PaymentRequest request) {
+    public PaymentApprovedResponse approve(@Valid @RequestBody PaymentRequest request) {
         return paymentService.approve(request);
     }
 
@@ -42,7 +44,10 @@ public class PaymentController {
 
     @GetMapping("/api/v1/fees")
     public FeeQueryResponse getFee(@RequestParam Grade grade, @RequestParam PayType payType, @RequestParam long amount) {
-        // amount가 1 이상 100,000,000 이하인지 확인하는 400 처리는 2단계입니다.
+        if (amount < 1 || amount > 100_000_000) {
+            throw new ApiException(HttpStatus.BAD_REQUEST,
+                    ErrorCode.INVALID_REQUEST, "amount는 1 이상 100,000,000 이하여야 합니다.", null);
+        }
         long fee = paymentService.getFee(grade, payType, amount);
         return new FeeQueryResponse(grade, payType, amount, fee);
     }
